@@ -271,6 +271,7 @@ export function getWriteAuthStatus(context: any): boolean {
     if (dopath.startsWith(THUMBNAILS_PATH)) return true;
 
     const permissions = permStr.split(",").map((p: string) => p.trim());
+    if (permissions.includes('readonly')) return false;
     return checkPathPermission(dopath, permissions);
   }
 

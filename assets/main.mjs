@@ -12,25 +12,43 @@ export async function generateThumbnail(file) {
 
   /** @type HTMLImageElement */
   if (file.type.startsWith("image/")) {
-    const image = await new Promise((resolve) => {
-      const image = new Image();
-      image.onload = () => resolve(image);
-      image.src = URL.createObjectURL(file);
-    });
-    ctx.drawImage(image, 0, 0, THUMBNAIL_SIZE, THUMBNAIL_SIZE);
+    const objectUrl = URL.createObjectURL(file);
+    try {
+      const image = await new Promise((resolve, reject) => {
+        const image = new Image();
+        image.onload = () => resolve(image);
+        image.onerror = () => reject(new Error("Image load failed"));
+        image.src = objectUrl;
+      });
+      ctx.drawImage(image, 0, 0, THUMBNAIL_SIZE, THUMBNAIL_SIZE);
+    } finally {
+      URL.revokeObjectURL(objectUrl);
+    }
   } else if (file.type === "video/mp4") {
     // Generate thumbnail from video
-    const video = await new Promise(async (resolve, reject) => {
-      const video = document.createElement("video");
-      video.muted = true;
-      video.src = URL.createObjectURL(file);
-      setTimeout(() => reject(new Error("Video load timeout")), 2000);
-      await video.play();
-      await video.pause();
-      video.currentTime = 0;
-      resolve(video);
-    });
-    ctx.drawImage(video, 0, 0, THUMBNAIL_SIZE, THUMBNAIL_SIZE);
+    const objectUrl = URL.createObjectURL(file);
+    try {
+      const video = await new Promise(async (resolve, reject) => {
+        const video = document.createElement("video");
+        const timeoutId = setTimeout(() => reject(new Error("Video load timeout")), 2000);
+
+        try {
+          video.muted = true;
+          video.src = objectUrl;
+          await video.play();
+          await video.pause();
+          video.currentTime = 0;
+          clearTimeout(timeoutId);
+          resolve(video);
+        } catch (error) {
+          clearTimeout(timeoutId);
+          reject(error);
+        }
+      });
+      ctx.drawImage(video, 0, 0, THUMBNAIL_SIZE, THUMBNAIL_SIZE);
+    } finally {
+      URL.revokeObjectURL(objectUrl);
+    }
   }
 
   /** @type Blob */

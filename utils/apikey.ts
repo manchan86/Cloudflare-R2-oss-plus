@@ -35,6 +35,7 @@ export interface ApiKeyAuthResult {
 const API_KEY_PREFIX = 'sk-';
 const API_KEY_STORAGE_PREFIX = 'apikey:';
 const API_KEY_LIST_KEY = 'apikey:_list';
+const API_KEY_HASH_PREFIX = 'apikey:keyhash:';
 
 // ==================== 工具函数 ====================
 
@@ -89,6 +90,24 @@ export function extractApiKeyFromHeaders(headers: Headers): string | null {
   return null;
 }
 
+async function hashApiKey(key: string): Promise<string> {
+  const data = new TextEncoder().encode(key);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+async function saveApiKeyIndex(kv: KVNamespace, key: string, id: string): Promise<void> {
+  const hash = await hashApiKey(key);
+  await kv.put(`${API_KEY_HASH_PREFIX}${hash}`, id);
+}
+
+async function deleteApiKeyIndex(kv: KVNamespace, key: string): Promise<void> {
+  const hash = await hashApiKey(key);
+  await kv.delete(`${API_KEY_HASH_PREFIX}${hash}`);
+}
+
 /**
  * 从 KV 获取所有 API Key ID 列表
  */
@@ -126,10 +145,21 @@ export async function getApiKeyById(kv: KVNamespace, id: string): Promise<ApiKey
  * 通过密钥值查找 API Key
  */
 export async function getApiKeyByKey(kv: KVNamespace, key: string): Promise<ApiKey | null> {
+  const hash = await hashApiKey(key);
+  const indexedId = await kv.get(`${API_KEY_HASH_PREFIX}${hash}`);
+  if (indexedId) {
+    const indexedApiKey = await getApiKeyById(kv, indexedId);
+    if (indexedApiKey?.key === key) {
+      return indexedApiKey;
+    }
+    await kv.delete(`${API_KEY_HASH_PREFIX}${hash}`);
+  }
+
   const list = await getApiKeyList(kv);
   for (const id of list) {
     const apiKey = await getApiKeyById(kv, id);
     if (apiKey && apiKey.key === key) {
+      await saveApiKeyIndex(kv, key, apiKey.id);
       return apiKey;
     }
   }
@@ -181,7 +211,10 @@ export async function createApiKey(
   };
 
   // 保存 API Key
-  await kv.put(`${API_KEY_STORAGE_PREFIX}${id}`, JSON.stringify(apiKey));
+  await Promise.all([
+    kv.put(`${API_KEY_STORAGE_PREFIX}${id}`, JSON.stringify(apiKey)),
+    saveApiKeyIndex(kv, key, id),
+  ]);
 
   // 更新列表
   const list = await getApiKeyList(kv);
@@ -220,7 +253,10 @@ export async function deleteApiKey(kv: KVNamespace, id: string): Promise<boolean
   if (!apiKey) return false;
 
   // 删除数据
-  await kv.delete(`${API_KEY_STORAGE_PREFIX}${id}`);
+  await Promise.all([
+    kv.delete(`${API_KEY_STORAGE_PREFIX}${id}`),
+    deleteApiKeyIndex(kv, apiKey.key),
+  ]);
 
   // 更新列表
   const list = await getApiKeyList(kv);

@@ -1,7 +1,7 @@
-import {get_auth_status} from "@/utils/auth";
+import { getWriteAuthStatusAsync } from "@/utils/auth";
 
 export async function onRequest(context) {
-   if(!get_auth_status(context)){
+   if(!(await getWriteAuthStatusAsync(context))){
     return new Response(JSON.stringify({ error: "没有操作权限" }), {
         status: 401,
         headers: { "Content-Type": "application/json" },

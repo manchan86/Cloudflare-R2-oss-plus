@@ -423,6 +423,20 @@ import {
   getFileTypeForFile,
   parseSearchQuery,
 } from "/assets/search.mjs";
+import {
+  FOLDER_DOWNLOAD_LIMITS,
+  fetchAllItemsRecursively,
+  getFolderDownloadLimitMessage,
+  getRelativeZipPath,
+  summarizeDownloadItems,
+} from "./file-ops.mjs";
+import {
+  ensureTrailingSlash,
+  getPathName,
+  isFolderMarker,
+  stripFolderMarker,
+  toFolderMarkerKey,
+} from "./item-paths.mjs";
 import { encodePathForUrl } from "./url-utils.mjs";
 import Dialog from "./Dialog.vue";
 import Header from "./Header.vue";
@@ -480,6 +494,7 @@ export default {
     showUploadPopup: false,
     uploadProgress: null,
     uploadQueue: [],
+    isProcessingUploadQueue: false,
     uploadResumeInfo: {},
     uploadConfig: {
       chunkSizeMb: 80,
@@ -658,9 +673,9 @@ export default {
     focusedItemName() {
       if (!this.focusedItem) return '';
       if (typeof this.focusedItem === 'string') {
-        return this.focusedItem.split('/').filter(Boolean).pop() || this.focusedItem;
+        return getPathName(this.focusedItem) || this.focusedItem;
       }
-      return this.focusedItem.key?.split('/').pop() || '';
+      return getPathName(this.focusedItem.key) || '';
     },
     isReadonly() {
       return this.currentUser?.isReadonly === true;
@@ -795,6 +810,29 @@ export default {
       return `/api/write/items/${encodePathForUrl(key)}`;
     },
 
+    getAuthHeaders() {
+      const headers = {};
+      const credentials = localStorage.getItem('auth_credentials');
+      if (credentials) {
+        headers['Authorization'] = `Basic ${credentials}`;
+      }
+      return headers;
+    },
+
+    getFileFetchHeaders() {
+      return this.fileBaseUrl ? {} : this.getAuthHeaders();
+    },
+
+    async fetchFileBlob(key) {
+      const response = await fetch(this.getFileUrl(key), {
+        headers: this.getFileFetchHeaders(),
+      });
+      if (!response.ok) {
+        throw new Error(`下载失败 (${response.status})`);
+      }
+      return response.blob();
+    },
+
     getFileUrl(key) {
       // 如果配置了 fileBaseUrl（CDN 回源），直接使用
       // 否则使用 /raw/ 路由（通过 Pages Function 代理）
@@ -860,10 +898,26 @@ export default {
       if (!this.selectedItems.length) return;
 
       // For single file, direct download
-      if (this.selectedItems.length === 1 && !this.selectedItems[0].endsWith('_$folder$')) {
-        const fileName = this.selectedItems[0].split('/').pop();
-        this.$refs.activityLog?.add('download', `下载 "${fileName}"`, 'success');
-        window.open(this.getFileUrl(this.selectedItems[0]), '_blank');
+      if (this.selectedItems.length === 1 && !isFolderMarker(this.selectedItems[0])) {
+        const fileName = getPathName(this.selectedItems[0]);
+        if (this.fileBaseUrl) {
+          this.$refs.activityLog?.add('download', `下载 "${fileName}"`, 'success');
+          window.open(this.getFileUrl(this.selectedItems[0]), '_blank');
+          return;
+        }
+
+        try {
+          const blob = await this.fetchFileBlob(this.selectedItems[0]);
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = fileName;
+          a.click();
+          URL.revokeObjectURL(url);
+          this.$refs.activityLog?.add('download', `下载 "${fileName}"`, 'success');
+        } catch (error) {
+          this.$refs.toast?.error(error?.message || '下载失败');
+        }
         return;
       }
 
@@ -879,25 +933,38 @@ export default {
       this.batchLoading = true;
       try {
         const zip = new JSZip();
+        const summary = { fileCount: 0, totalBytes: 0 };
 
         for (const key of this.selectedItems) {
-          if (key.endsWith('_$folder$')) {
+          if (isFolderMarker(key)) {
             // Download folder contents
-            const folderPath = key.replace('_$folder$', '');
+            const folderPath = stripFolderMarker(key);
             const items = await this.getAllItems(folderPath);
+            const folderSummary = summarizeDownloadItems(items);
+            summary.fileCount += folderSummary.fileCount;
+            summary.totalBytes += folderSummary.totalBytes;
+            const limitMessage = getFolderDownloadLimitMessage(summary, FOLDER_DOWNLOAD_LIMITS);
+            if (limitMessage) {
+              throw new Error(limitMessage);
+            }
             for (const item of items) {
               if (!item.key.endsWith('_$folder$')) {
-                const response = await fetch(this.getFileUrl(item.key));
-                const blob = await response.blob();
-                const relativePath = item.key.substring(folderPath.length);
+                const blob = await this.fetchFileBlob(item.key);
+                const relativePath = getRelativeZipPath(folderPath, item.key);
                 zip.file(relativePath, blob);
               }
             }
           } else {
             // Download single file
-            const response = await fetch(this.getFileUrl(key));
-            const blob = await response.blob();
-            const fileName = key.split('/').pop();
+            summary.fileCount += 1;
+            const matchedFile = this.files.find((file) => file.key === key);
+            summary.totalBytes += Number(matchedFile?.size) || 0;
+            const limitMessage = getFolderDownloadLimitMessage(summary, FOLDER_DOWNLOAD_LIMITS);
+            if (limitMessage) {
+              throw new Error(limitMessage);
+            }
+            const blob = await this.fetchFileBlob(key);
+            const fileName = getPathName(key);
             zip.file(fileName, blob);
           }
         }
@@ -914,7 +981,7 @@ export default {
       } catch (error) {
         console.error('Batch download failed:', error);
         this.$refs.activityLog?.update(logId, 'error', `批量下载失败`);
-        this.$refs.toast?.error('批量下载失败');
+        this.$refs.toast?.error(error?.message || '批量下载失败');
       } finally {
         this.batchLoading = false;
       }
@@ -1162,14 +1229,14 @@ export default {
         this.previewFileUrl = this.getFileUrl(file.key);
         // fetchUrl 始终使用 /raw/ 路由，避免 CORS 问题
         this.previewFetchUrl = `/raw/${encodePathForUrl(file.key)}`;
-        this.previewFileName = file.key?.split('/').pop() || '';
+          this.previewFileName = getPathName(file.key) || '';
         this.previewContentType = file.httpMetadata?.contentType || '';
         this.previewFileKey = file.key || '';
       } else {
         // 兼容旧的字符串 URL 调用
         this.previewFileUrl = file;
         this.previewFetchUrl = file;
-        this.previewFileName = file.split('/').pop() || '';
+          this.previewFileName = getPathName(file) || '';
         this.previewContentType = '';
         this.previewFileKey = '';
       }
@@ -1230,15 +1297,11 @@ export default {
       this.$refs.statsCards?.refresh();
     },
 
-    async processUploadQueue() {
-      if (!this.uploadQueue.length) {
-        this.fetchFiles();
-        this.$refs.statsCards?.refresh();
-        this.uploadProgress = null;
-        return;
-      }
+    scheduleUploadQueue() {
+      setTimeout(() => this.processUploadQueue());
+    },
 
-      const { basedir, file, resume: taskResume } = this.uploadQueue.pop(0);
+    async processSingleUploadTask({ basedir, file, resume: taskResume }) {
       const uploadKey = this.getUploadResumeKey(file, basedir);
       const chunkSizeBytes = this.getUploadChunkSizeBytes();
       const resumeInfo = taskResume && taskResume.chunkSize === chunkSizeBytes
@@ -1364,10 +1427,9 @@ export default {
             type: 'warning',
             callback: () => {
               this.uploadQueue.unshift({ basedir, file, resume: this.uploadResumeInfo[uploadKey] });
-              setTimeout(() => this.processUploadQueue());
+              this.scheduleUploadQueue();
             }
           });
-          setTimeout(this.processUploadQueue);
           return;
         }
         const status = error.response?.status;
@@ -1402,11 +1464,30 @@ export default {
         this.$refs.toast?.error(`"${fileName}" 上传失败：${errorMsg}`);
         console.log(`Upload ${file.name} failed`, error);
       }
-      setTimeout(this.processUploadQueue);
+    },
+
+    async processUploadQueue() {
+      if (this.isProcessingUploadQueue) return;
+
+      this.isProcessingUploadQueue = true;
+      try {
+        while (this.uploadQueue.length) {
+          const task = this.uploadQueue.shift();
+          if (!task) continue;
+          await this.processSingleUploadTask(task);
+        }
+      } finally {
+        this.isProcessingUploadQueue = false;
+        this.uploadProgress = null;
+        if (!this.uploadQueue.length) {
+          this.fetchFiles();
+          this.$refs.statsCards?.refresh();
+        }
+      }
     },
 
     async removeFile(key) {
-      const fileName = key.split('/').pop().replace('_$folder$', '');
+      const fileName = getPathName(key);
       this.showContextMenu = false;
 
       this.showConfirm({
@@ -1432,7 +1513,7 @@ export default {
     },
 
     renameFile(key) {
-      const currentName = key.split('/').pop();
+      const currentName = getPathName(key);
       this.showContextMenu = false;
       this.showInput({
         title: '重命名',
@@ -1461,7 +1542,7 @@ export default {
     renameFolder(folderPath) {
       // folderPath 格式: "path/to/folder/" 或 "folder/"
       // 规范化路径：确保以 / 结尾
-      const normalizedPath = folderPath.endsWith('/') ? folderPath : folderPath + '/';
+      const normalizedPath = ensureTrailingSlash(folderPath);
       const pathParts = normalizedPath.replace(/\/$/, '').split('/');
       const currentName = pathParts.pop();
       const parentPath = pathParts.length > 0 ? pathParts.join('/') + '/' : '';
@@ -1487,8 +1568,8 @@ export default {
             const sourcePath = normalizedPath; // 如 "docs/old/"
             const targetPath = parentPath + newName + '/'; // 如 "docs/new/"
             // 文件夹标记格式: "docs/old_$folder$" (不带末尾斜杠)
-            const sourceMarker = sourcePath.replace(/\/$/, '') + '_$folder$';
-            const targetMarker = targetPath.replace(/\/$/, '') + '_$folder$';
+            const sourceMarker = toFolderMarkerKey(sourcePath);
+            const targetMarker = toFolderMarkerKey(targetPath);
 
             // 获取文件夹内所有项目
             const allItems = await this.getAllItems(sourcePath);
@@ -1497,7 +1578,7 @@ export default {
 
             // 复制所有文件到新路径
             for (const item of allItems) {
-              const relativePath = item.key.substring(sourcePath.length);
+              const relativePath = getRelativeZipPath(sourcePath, item.key);
               const newItemPath = targetPath + relativePath;
 
               try {
@@ -1537,8 +1618,8 @@ export default {
     },
 
     moveFile(key) {
-      const fileName = key.split('/').pop();
-      const displayName = fileName.endsWith('_$folder$') ? fileName.slice(0, -9) : fileName;
+      const fileName = getPathName(key);
+      const displayName = fileName;
       this.showContextMenu = false;
 
       this.showInput({
@@ -1550,12 +1631,12 @@ export default {
         icon: 'move',
         confirmText: '移动',
         callback: async (targetPath) => {
-          const normalizedPath = targetPath === '' ? '' : (targetPath.endsWith('/') ? targetPath : targetPath + '/');
-          const finalFileName = fileName.endsWith('_$folder$') ? fileName.slice(0, -9) : fileName;
+          const normalizedPath = targetPath === '' ? '' : ensureTrailingSlash(targetPath);
+          const finalFileName = fileName;
 
           try {
-            if (key.endsWith('_$folder$')) {
-              const sourceBasePath = key.slice(0, -9);
+            if (isFolderMarker(key)) {
+              const sourceBasePath = stripFolderMarker(key);
               const targetBasePath = normalizedPath + finalFileName + '/';
 
               const allItems = await this.getAllItems(sourceBasePath);
@@ -1563,7 +1644,7 @@ export default {
               let processedItems = 0;
 
               for (const item of allItems) {
-                const relativePath = item.key.substring(sourceBasePath.length);
+                const relativePath = getRelativeZipPath(sourceBasePath, item.key);
                 const newPath = targetBasePath + relativePath;
 
                 try {
@@ -1576,7 +1657,7 @@ export default {
                 }
               }
 
-              const targetFolderPath = targetBasePath.slice(0, -1) + '_$folder$';
+              const targetFolderPath = toFolderMarkerKey(targetBasePath);
               await this.copyPaste(key, targetFolderPath);
               await axios.delete(this.getWriteItemUrl(key));
               this.uploadProgress = null;
@@ -1604,18 +1685,22 @@ export default {
       this.showContextMenu = false;
       this.batchLoading = true;
 
-      const folderName = folderPath.split('/').filter(Boolean).pop() || 'folder';
+      const folderName = getPathName(folderPath) || 'folder';
       const logId = this.$refs.activityLog?.add('download', `下载文件夹 "${folderName}"`, 'pending');
 
       try {
         const zip = new JSZip();
         const items = await this.getAllItems(folderPath);
+        const summary = summarizeDownloadItems(items);
+        const limitMessage = getFolderDownloadLimitMessage(summary, FOLDER_DOWNLOAD_LIMITS);
+        if (limitMessage) {
+          throw new Error(limitMessage);
+        }
 
         for (const item of items) {
           if (!item.key.endsWith('_$folder$')) {
-            const response = await fetch(this.getFileUrl(item.key));
-            const blob = await response.blob();
-            const relativePath = item.key.substring(folderPath.length);
+            const blob = await this.fetchFileBlob(item.key);
+            const relativePath = getRelativeZipPath(folderPath, item.key);
             zip.file(relativePath, blob);
           }
         }
@@ -1631,59 +1716,23 @@ export default {
       } catch (error) {
         console.error('Download folder failed:', error);
         this.$refs.activityLog?.update(logId, 'error', `下载文件夹 "${folderName}" 失败`);
-        this.$refs.toast?.error('文件夹下载失败');
+        this.$refs.toast?.error(error?.message || '文件夹下载失败');
       } finally {
         this.batchLoading = false;
       }
     },
 
     async getAllItems(prefix) {
-      const items = [];
-      let marker = null;
-
-      // 确保 prefix 以 / 结尾
-      const normalizedPrefix = prefix.endsWith('/') ? prefix : prefix + '/';
-
-      do {
-        const url = new URL(this.getChildrenUrl(normalizedPrefix), window.location.origin);
-        if (marker) {
-          url.searchParams.set('marker', marker);
-        }
-
-        // 添加认证头
-        const headers = {};
-        const credentials = localStorage.getItem('auth_credentials');
-        if (credentials) {
-          headers['Authorization'] = `Basic ${credentials}`;
-        }
-
-        const response = await fetch(url, { headers });
-        const data = await response.json();
-
-        items.push(...data.value);
-
-        for (const folder of data.folders) {
-          // folder 格式: "docs/subfolder/" (带末尾斜杠)
-          // 文件夹标记格式: "docs/subfolder_$folder$" (不带末尾斜杠)
-          const folderMarkerKey = folder.replace(/\/$/, '') + '_$folder$';
-          items.push({
-            key: folderMarkerKey,
-            size: 0,
-            uploaded: new Date().toISOString(),
-          });
-
-          const subItems = await this.getAllItems(folder);
-          items.push(...subItems);
-        }
-
-        marker = data.marker;
-      } while (marker);
-
-      return items;
+      return fetchAllItemsRecursively({
+        prefix: stripFolderMarker(prefix),
+        buildChildrenUrl: (currentPrefix) => this.getChildrenUrl(currentPrefix),
+        getHeaders: () => this.getAuthHeaders(),
+        concurrency: FOLDER_DOWNLOAD_LIMITS.concurrency,
+      });
     },
 
     uploadFiles(files) {
-      if (this.cwd && !this.cwd.endsWith("/")) this.cwd += "/";
+      if (this.cwd) this.cwd = ensureTrailingSlash(this.cwd);
 
       // 访客上传需要验证密码
       if (this.currentUser?.isGuest && !this.guestUploadPassword) {
@@ -1768,7 +1817,7 @@ export default {
 
     enqueueUploadTask(task) {
       this.uploadQueue.push(task);
-      setTimeout(() => this.processUploadQueue());
+      this.scheduleUploadQueue();
     },
 
     clearUploadResumeInfo(file, basedir) {

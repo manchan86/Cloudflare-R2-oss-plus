@@ -149,6 +149,7 @@
 </template>
 
 <script>
+import { getPathName, isFolderMarker, stripFolderMarker } from "./item-paths.mjs";
 import { encodePathForUrl } from "./url-utils.mjs";
 
 export default {
@@ -178,13 +179,13 @@ export default {
   emits: ['click', 'select', 'contextmenu', 'preview'],
   computed: {
     isFolder() {
-      return this.file.key?.endsWith('_$folder$') || this.file.isFolder;
+      return isFolderMarker(this.file.key) || this.file.isFolder;
     },
     fileName() {
       if (this.isFolder) {
-        return this.file.key?.replace('_$folder$', '').split('/').filter(Boolean).pop() || this.file.name || '';
+        return getPathName(stripFolderMarker(this.file.key)) || this.file.name || '';
       }
-      return this.file.key?.split('/').pop() || this.file.name || '';
+      return getPathName(this.file.key) || this.file.name || '';
     },
     fileIcon() {
       if (this.isFolder) return 'folder';

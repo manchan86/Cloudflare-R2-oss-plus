@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "./.tmp-test",
+    "rootDir": "./",
+    "paths": {}
+  },
+  "include": ["utils/auth.ts", "utils/apikey.ts"]
+}
