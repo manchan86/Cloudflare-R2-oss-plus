@@ -1,3 +1,5 @@
+import { isFolderMarker, toFolderMarkerKey } from "./item-paths.mjs";
+
 export const FOLDER_DOWNLOAD_LIMITS = Object.freeze({
   maxFiles: 500,
   maxBytes: 1024 * 1024 * 1024,
@@ -24,7 +26,7 @@ function formatBytes(bytes) {
 export function summarizeDownloadItems(items) {
   return (items || []).reduce(
     (summary, item) => {
-      if (!item?.key || item.key.endsWith("_$folder$")) {
+      if (!item?.key || isFolderMarker(item.key)) {
         return summary;
       }
 
@@ -72,20 +74,22 @@ async function fetchChildrenPage({ prefix, marker, buildChildrenUrl, getHeaders,
   return response.json();
 }
 
-export async function fetchAllItemsRecursively({
+export async function fetchFolderTreeRecursively({
   prefix,
   buildChildrenUrl,
   getHeaders,
   fetchImpl = fetch,
   concurrency = FOLDER_DOWNLOAD_LIMITS.concurrency,
 }) {
-  const items = [];
-  const folderTimestamp = new Date().toISOString();
-  const pendingPrefixes = [normalizeFolderPrefix(prefix)];
+  const files = [];
+  const folders = [];
+  const pendingPrefixes = [{ prefix: normalizeFolderPrefix(prefix), includeCurrentFolder: false }];
   let cursor = 0;
 
-  async function drainPrefix(currentPrefix) {
+  async function drainPrefix({ prefix: currentPrefix, includeCurrentFolder }) {
     let marker = null;
+    const currentFiles = [];
+    const childFolders = [];
 
     do {
       const data = await fetchChildrenPage({
@@ -96,27 +100,49 @@ export async function fetchAllItemsRecursively({
         fetchImpl,
       });
 
-      items.push(...(Array.isArray(data?.value) ? data.value : []));
+      const pageFiles = Array.isArray(data?.value) ? data.value : [];
+      const pageFolders = Array.isArray(data?.folders)
+        ? data.folders.map((folder) => normalizeFolderPrefix(folder))
+        : [];
 
-      for (const folder of Array.isArray(data?.folders) ? data.folders : []) {
-        pendingPrefixes.push(folder);
-        items.push({
-          key: folder.replace(/\/$/, "") + "_$folder$",
-          size: 0,
-          uploaded: folderTimestamp,
-        });
-      }
-
+      files.push(...pageFiles);
+      currentFiles.push(...pageFiles);
+      childFolders.push(...pageFolders);
       marker = data?.marker || null;
     } while (marker);
+
+    if (includeCurrentFolder) {
+      folders.push({
+        prefix: currentPrefix,
+        isEmpty: currentFiles.length === 0 && childFolders.length === 0,
+      });
+    }
+
+    for (const folder of childFolders) {
+      pendingPrefixes.push({ prefix: folder, includeCurrentFolder: true });
+    }
   }
 
   const batchSize = Math.max(1, Number(concurrency) || 1);
   while (cursor < pendingPrefixes.length) {
     const batch = pendingPrefixes.slice(cursor, cursor + batchSize);
     cursor += batch.length;
-    await Promise.all(batch.map((currentPrefix) => drainPrefix(currentPrefix)));
+    await Promise.all(batch.map((entry) => drainPrefix(entry)));
   }
 
-  return items;
+  return { files, folders };
+}
+
+export async function fetchAllItemsRecursively(options) {
+  const { files, folders } = await fetchFolderTreeRecursively(options);
+  const folderTimestamp = new Date().toISOString();
+
+  return [
+    ...files,
+    ...folders.map((folder) => ({
+      key: toFolderMarkerKey(folder.prefix),
+      size: 0,
+      uploaded: folderTimestamp,
+    })),
+  ];
 }

@@ -426,6 +426,7 @@ import {
 import {
   FOLDER_DOWNLOAD_LIMITS,
   fetchAllItemsRecursively,
+  fetchFolderTreeRecursively,
   getFolderDownloadLimitMessage,
   getRelativeZipPath,
   summarizeDownloadItems,
@@ -997,15 +998,20 @@ export default {
         type: 'danger',
         callback: async () => {
           this.batchLoading = true;
-          const count = this.selectedItems.length;
+          const items = [...this.selectedItems];
+          const count = items.length;
           const logId = this.$refs.activityLog?.add('delete', `批量删除 ${count} 个项目`, 'pending');
-           try {
-             for (const key of this.selectedItems) {
-              await axios.delete(this.getWriteItemUrl(key));
-             }
-             this.clearSelection();
-             this.fetchFiles();
-             this.$refs.statsCards?.refresh();
+          try {
+            for (const key of items) {
+              if (isFolderMarker(key)) {
+                await this.deleteFolderRecursively(key);
+              } else {
+                await axios.delete(this.getWriteItemUrl(key));
+              }
+            }
+            this.clearSelection();
+            this.fetchFiles();
+            this.$refs.statsCards?.refresh();
             this.$refs.activityLog?.update(logId, 'success', `批量删除 ${count} 个项目成功`);
             this.$refs.toast?.success('删除成功');
           } catch (error) {
@@ -1014,11 +1020,11 @@ export default {
             this.$refs.toast?.error('批量删除失败');
           } finally {
             this.batchLoading = false;
+            this.uploadProgress = null;
           }
         }
       });
     },
-
     batchMove() {
       if (!this.selectedItems.length) return;
 
@@ -1031,33 +1037,45 @@ export default {
         icon: 'move',
         confirmText: '移动',
         callback: async (targetPath) => {
-          const normalizedPath = targetPath === '' ? '' : (targetPath.endsWith('/') ? targetPath : targetPath + '/');
-          const count = this.selectedItems.length;
+          const normalizedPath = targetPath === '' ? '' : ensureTrailingSlash(targetPath);
+          const items = [...this.selectedItems];
+          const count = items.length;
           const logId = this.$refs.activityLog?.add('move', `批量移动 ${count} 个项目`, 'pending');
 
           this.batchLoading = true;
-           try {
-             for (const key of this.selectedItems) {
-               const fileName = key.split('/').pop();
-               const targetFilePath = normalizedPath + fileName;
-               await this.copyPaste(key, targetFilePath);
-              await axios.delete(this.getWriteItemUrl(key));
-             }
-             this.clearSelection();
-             this.fetchFiles();
-             this.$refs.activityLog?.update(logId, 'success', `批量移动 ${count} 个项目成功`);
-             this.$refs.toast?.success('移动成功');
+          try {
+            for (const key of items) {
+              const fileName = getPathName(key);
+              if (isFolderMarker(key)) {
+                const targetFolderPath = `${normalizedPath}${fileName}/`;
+                if (ensureTrailingSlash(stripFolderMarker(key)) === targetFolderPath) {
+                  continue;
+                }
+                await this.moveFolderRecursively(key, targetFolderPath);
+              } else {
+                const targetFilePath = normalizedPath + fileName;
+                if (targetFilePath === key) {
+                  continue;
+                }
+                await this.copyPaste(key, targetFilePath);
+                await axios.delete(this.getWriteItemUrl(key));
+              }
+            }
+            this.clearSelection();
+            this.fetchFiles();
+            this.$refs.activityLog?.update(logId, 'success', `批量移动 ${count} 个项目成功`);
+            this.$refs.toast?.success('移动成功');
           } catch (error) {
             console.error('Batch move failed:', error);
             this.$refs.activityLog?.update(logId, 'error', `批量移动失败`);
             this.$refs.toast?.error('批量移动失败');
           } finally {
             this.batchLoading = false;
+            this.uploadProgress = null;
           }
         }
       });
     },
-
     // Context Menu
     showContextMenuFor(event, item) {
       this.focusedItem = item;
@@ -1131,6 +1149,88 @@ export default {
       });
     },
 
+    async deleteFolderRecursively(folderPath) {
+      const normalizedFolderPath = ensureTrailingSlash(stripFolderMarker(folderPath));
+      const { files, folders } = await this.getFolderTree(normalizedFolderPath);
+      const folderPrefixes = [
+        ...folders.map((folder) => folder.prefix).sort((a, b) => b.length - a.length),
+        normalizedFolderPath,
+      ];
+      const totalItems = files.length + folderPrefixes.length;
+      let processedItems = 0;
+
+      const updateProgress = () => {
+        this.uploadProgress = totalItems ? (processedItems / totalItems) * 100 : null;
+      };
+
+      for (const file of files) {
+        await axios.delete(this.getWriteItemUrl(file.key));
+        processedItems += 1;
+        updateProgress();
+      }
+
+      for (const prefix of folderPrefixes) {
+        try {
+          await axios.delete(this.getWriteItemUrl(toFolderMarkerKey(prefix)));
+        } catch (error) {
+          if (error.response?.status !== 404) {
+            throw error;
+          }
+        }
+        processedItems += 1;
+        updateProgress();
+      }
+    },
+
+    async moveFolderRecursively(sourcePath, targetPath) {
+      const sourceBasePath = ensureTrailingSlash(stripFolderMarker(sourcePath));
+      const targetBasePath = ensureTrailingSlash(stripFolderMarker(targetPath));
+      const { files, folders } = await this.getFolderTree(sourceBasePath);
+      const rootIsEmpty = files.length === 0 && folders.length === 0;
+      const folderEntries = [
+        { prefix: sourceBasePath, isEmpty: rootIsEmpty },
+        ...folders,
+      ].sort((a, b) => b.prefix.length - a.prefix.length);
+      const totalItems = files.length + folderEntries.length;
+      let processedItems = 0;
+
+      const updateProgress = () => {
+        this.uploadProgress = totalItems ? (processedItems / totalItems) * 100 : null;
+      };
+
+      for (const file of files) {
+        const relativePath = getRelativeZipPath(sourceBasePath, file.key);
+        await this.copyPaste(file.key, targetBasePath + relativePath);
+        await axios.delete(this.getWriteItemUrl(file.key));
+        processedItems += 1;
+        updateProgress();
+      }
+
+      for (const folder of folderEntries) {
+        const relativePath =
+          folder.prefix === sourceBasePath
+            ? ''
+            : getRelativeZipPath(sourceBasePath, folder.prefix);
+        const sourceMarker = toFolderMarkerKey(folder.prefix);
+        const targetMarker = toFolderMarkerKey(`${targetBasePath}${relativePath}`);
+
+        try {
+          await this.copyPaste(sourceMarker, targetMarker);
+          await axios.delete(this.getWriteItemUrl(sourceMarker));
+        } catch (error) {
+          if (error.response?.status === 404) {
+            if (folder.isEmpty || folder.prefix === sourceBasePath) {
+              await axios.put(this.getWriteItemUrl(targetMarker), '');
+            }
+          } else {
+            throw error;
+          }
+        }
+
+        processedItems += 1;
+        updateProgress();
+      }
+    },
     createFolder() {
       this.showUploadPopup = false;
       this.showInput({
@@ -1498,7 +1598,11 @@ export default {
         callback: async () => {
           const logId = this.$refs.activityLog?.add('delete', `删除 "${fileName}"`, 'pending');
           try {
-            await axios.delete(this.getWriteItemUrl(key));
+            if (isFolderMarker(key)) {
+              await this.deleteFolderRecursively(key);
+            } else {
+              await axios.delete(this.getWriteItemUrl(key));
+            }
             this.fetchFiles();
             this.$refs.statsCards?.refresh();
             this.$refs.activityLog?.update(logId, 'success', `删除 "${fileName}" 成功`);
@@ -1507,11 +1611,12 @@ export default {
             console.error('Delete failed:', error);
             this.$refs.activityLog?.update(logId, 'error', `删除 "${fileName}" 失败`);
             this.$refs.toast?.error('删除失败');
+          } finally {
+            this.uploadProgress = null;
           }
         }
       });
     },
-
     renameFile(key) {
       const currentName = getPathName(key);
       this.showContextMenu = false;
@@ -1565,45 +1670,9 @@ export default {
           }
 
           try {
-            const sourcePath = normalizedPath; // 如 "docs/old/"
-            const targetPath = parentPath + newName + '/'; // 如 "docs/new/"
-            // 文件夹标记格式: "docs/old_$folder$" (不带末尾斜杠)
-            const sourceMarker = toFolderMarkerKey(sourcePath);
-            const targetMarker = toFolderMarkerKey(targetPath);
-
-            // 获取文件夹内所有项目
-            const allItems = await this.getAllItems(sourcePath);
-            const totalItems = allItems.length + 1; // +1 是文件夹标记本身
-            let processedItems = 0;
-
-            // 复制所有文件到新路径
-            for (const item of allItems) {
-              const relativePath = getRelativeZipPath(sourcePath, item.key);
-              const newItemPath = targetPath + relativePath;
-
-              try {
-                await this.copyPaste(item.key, newItemPath);
-                await axios.delete(this.getWriteItemUrl(item.key));
-                processedItems++;
-                this.uploadProgress = (processedItems / totalItems) * 100;
-              } catch (error) {
-                console.error(`重命名 ${item.key} 失败:`, error);
-                throw error; // 抛出错误以便外层捕获
-              }
-            }
-
-            // 处理文件夹标记：尝试复制，如果不存在则创建新的
-            try {
-              await this.copyPaste(sourceMarker, targetMarker);
-              await axios.delete(this.getWriteItemUrl(sourceMarker));
-            } catch (error) {
-              // 源文件夹标记不存在，直接创建新的标记
-              if (error.response?.status === 404) {
-                await axios.put(this.getWriteItemUrl(targetMarker), '');
-              } else {
-                throw error;
-              }
-            }
+            const sourcePath = normalizedPath;
+            const targetPath = parentPath + newName + '/';
+            await this.moveFolderRecursively(sourcePath, targetPath);
             this.uploadProgress = null;
 
             this.$refs.toast?.success('文件夹重命名成功');
@@ -1616,7 +1685,6 @@ export default {
         }
       });
     },
-
     moveFile(key) {
       const fileName = getPathName(key);
       const displayName = fileName;
@@ -1636,33 +1704,17 @@ export default {
 
           try {
             if (isFolderMarker(key)) {
-              const sourceBasePath = stripFolderMarker(key);
-              const targetBasePath = normalizedPath + finalFileName + '/';
-
-              const allItems = await this.getAllItems(sourceBasePath);
-              const totalItems = allItems.length;
-              let processedItems = 0;
-
-              for (const item of allItems) {
-                const relativePath = getRelativeZipPath(sourceBasePath, item.key);
-                const newPath = targetBasePath + relativePath;
-
-                try {
-                  await this.copyPaste(item.key, newPath);
-                  await axios.delete(this.getWriteItemUrl(item.key));
-                  processedItems++;
-                  this.uploadProgress = (processedItems / totalItems) * 100;
-                } catch (error) {
-                  console.error(`移动 ${item.key} 失败:`, error);
-                }
+              const sourceBasePath = ensureTrailingSlash(stripFolderMarker(key));
+              const targetBasePath = `${normalizedPath}${finalFileName}/`;
+              if (sourceBasePath === targetBasePath) {
+                return;
               }
-
-              const targetFolderPath = toFolderMarkerKey(targetBasePath);
-              await this.copyPaste(key, targetFolderPath);
-              await axios.delete(this.getWriteItemUrl(key));
-              this.uploadProgress = null;
+              await this.moveFolderRecursively(sourceBasePath, targetBasePath);
             } else {
               const targetFilePath = normalizedPath + finalFileName;
+              if (targetFilePath === key) {
+                return;
+              }
               await this.copyPaste(key, targetFilePath);
               await axios.delete(this.getWriteItemUrl(key));
             }
@@ -1671,11 +1723,12 @@ export default {
           } catch (error) {
             console.error('移动失败:', error);
             this.$refs.toast?.error('移动失败，请检查目标路径是否正确');
+          } finally {
+            this.uploadProgress = null;
           }
         }
       });
     },
-
     async downloadFolder(folderPath) {
       if (typeof JSZip === 'undefined') {
         this.$refs.toast?.error('文件夹下载需要 JSZip 库支持');
@@ -1722,6 +1775,15 @@ export default {
       }
     },
 
+    async getFolderTree(prefix) {
+      return fetchFolderTreeRecursively({
+        prefix: stripFolderMarker(prefix),
+        buildChildrenUrl: (currentPrefix) => this.getChildrenUrl(currentPrefix),
+        getHeaders: () => this.getAuthHeaders(),
+        concurrency: FOLDER_DOWNLOAD_LIMITS.concurrency,
+      });
+    },
+
     async getAllItems(prefix) {
       return fetchAllItemsRecursively({
         prefix: stripFolderMarker(prefix),
@@ -1730,7 +1792,6 @@ export default {
         concurrency: FOLDER_DOWNLOAD_LIMITS.concurrency,
       });
     },
-
     uploadFiles(files) {
       if (this.cwd) this.cwd = ensureTrailingSlash(this.cwd);
 
