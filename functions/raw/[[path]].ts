@@ -70,6 +70,8 @@ function isFileAllowed(filePath: string, allowedPaths: string[], isAdmin: boolea
 
   for (const allowed of allowedPaths) {
     const normalizedAllowed = allowed.replace(/\/+$/, '');
+    // 支持通配符 *，允许访问所有文件
+    if (normalizedAllowed === '*') return true;
 
     // 文件在允许的目录中
     if (normalizedPath === normalizedAllowed) return true;
