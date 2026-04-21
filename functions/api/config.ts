@@ -17,7 +17,7 @@ export const onRequestGet: PagesFunction<Env> = async (context) => {
   // FILE_BASE_URL: 用于 CDN 回源场景
   // 例如设置为 https://cdn.example.com，前端会请求 https://cdn.example.com/file.jpg
   // 如果不设置，前端使用 /raw/file.jpg（通过 Pages Function 代理）
-  const fileBaseUrl = env.FILE_BASE_URL || '';
+  const fileBaseUrl = env.FILE_BASE_URL || env.PUBURL || '';
 
   return Response.json({
     fileBaseUrl,
