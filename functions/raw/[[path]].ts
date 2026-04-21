@@ -65,15 +65,11 @@ function isFileAllowed(filePath: string, allowedPaths: string[], isAdmin: boolea
   if (filePath.startsWith(THUMBNAILS_PATH)) return true;
 
   if (!allowedPaths || allowedPaths.length === 0) return false;
-	// 支持通配符 * 表示允许所有路径
-	if (allowedPaths.includes('*')) return true;
 
   const normalizedPath = filePath.replace(/\/+$/, '');
 
   for (const allowed of allowedPaths) {
     const normalizedAllowed = allowed.replace(/\/+$/, '');
-    // 支持通配符 *，允许访问所有文件
-    if (normalizedAllowed === '*') return true;
 
     // 文件在允许的目录中
     if (normalizedPath === normalizedAllowed) return true;
